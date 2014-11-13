@@ -1,0 +1,654 @@
+diff --git a/android/frameworks/base/core/java/android/os/BLEEventObserver.java b/android/frameworks/base/core/java/android/os/BLEEventObserver.java
+new file mode 100644
+index 0000000..d915ac9
+--- /dev/null
++++ b/android/frameworks/base/core/java/android/os/BLEEventObserver.java
+@@ -0,0 +1,193 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.os;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import android.util.Log;
++
++/**
++ * BLEEventObserver is an abstract class that receives netlink message from the kernel.<p>
++ *
++ * Subclass BLEEventObserver, implementing onBLEEvent(BLEEvent event), then call
++ * startObserving() with a match string. The BLEEvent thread will then call your
++ * onBLEEvent() method when a BLEEvent occurs that contains your match string.<p>
++ *
++ * Call stopObserving() to stop receiving BLEEvent's.<p>
++ *
++ * There is only one BLEEvent thread per process, even if that process has
++ * multiple BLEEventObserver subclass instances. The BLEEvent thread starts when
++ * the startObserving() is called for the first time in that process. Once
++ * started the BLEEvent thread will not stop (although it can stop notifying
++ * BLEEventObserver's via stopObserving()).<p>
++ *
++ * @hide
++*/
++public abstract class BLEEventObserver {
++    private static final String TAG = BLEEventObserver.class.getSimpleName();
++
++    /**
++     * Representation of a BLEEvent.
++     */
++    static public class BLEEvent {
++        // collection of key=value pairs parsed from the uevent message
++        public HashMap<String,String> mMap = new HashMap<String,String>();
++
++        public BLEEvent(String message) {
++            int offset = 0;
++            int length = message.length();
++	    //ble_status=SWITCH_STATE:3  parse '=' and ':', put "SWITCH_STATE" and "3" in map
++            while (offset < length) {
++                int equals = message.indexOf('=', offset);
++                int at = message.indexOf(':', offset);
++                if (at < 0) break;
++
++                if (equals > offset && equals < at) {
++                    // key is before the equals sign, and value is after
++                    mMap.put(message.substring(equals+1, at),
++                            message.substring(at+1, length));
++                }
++
++                offset = length;
++            }
++        }
++
++        public String get(String key) {
++            return mMap.get(key);
++        }
++
++        public String get(String key, String defaultValue) {
++            String result = mMap.get(key);
++            return (result == null ? defaultValue : result);
++        }
++
++        public String toString() {
++            return mMap.toString();
++        }
++    }
++
++    private static BLEEventThread sThread;
++    private static boolean sThreadStarted = false;
++
++    private static class BLEEventThread extends Thread {
++        /** Many to many mapping of string match to observer.
++         *  Multimap would be better, but not available in android, so use
++         *  an ArrayList where even elements are the String match and odd
++         *  elements the corresponding BLEEventObserver observer */
++        private ArrayList<Object> mObservers = new ArrayList<Object>();
++        
++        BLEEventThread() {
++            super("BLEEventObserver");
++        }
++        
++        public void run() {
++            ble_native_setup();
++
++            byte[] buffer = new byte[1024];
++            int len;
++            while (true) {
++                len = ble_next_event(buffer);
++                if (len > 0) {
++                    String bufferStr = new String(buffer, 0, len);  // easier to search a String
++		    Log.e(TAG,"get ble status string: " + bufferStr);
++                    synchronized (mObservers) {
++                        for (int i = 0; i < mObservers.size(); i += 2) {
++                            if (bufferStr.indexOf((String)mObservers.get(i)) != -1) {
++                                ((BLEEventObserver)mObservers.get(i+1))
++                                        .onBLEEvent(new BLEEvent(bufferStr));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        public void addObserver(String match, BLEEventObserver observer) {
++            synchronized(mObservers) {
++                mObservers.add(match);
++                mObservers.add(observer);
++            }
++        }
++        /** Removes every key/value pair where value=observer from mObservers */
++        public void removeObserver(BLEEventObserver observer) {
++            synchronized(mObservers) {
++                boolean found = true;
++                while (found) {
++                    found = false;
++                    for (int i = 0; i < mObservers.size(); i += 2) {
++                        if (mObservers.get(i+1) == observer) {
++                            mObservers.remove(i+1);
++                            mObservers.remove(i);
++                            found = true;
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    private static native void ble_native_setup();
++    private static native int ble_next_event(byte[] buffer);
++
++    private static final synchronized void ensureThreadStarted() {
++        if (sThreadStarted == false) {
++            sThread = new BLEEventThread();
++            sThread.start();
++            sThreadStarted = true;
++        }
++    }
++
++    /**
++     * Begin observation of BLEEvent's.<p>
++     * This method will cause the BLEEvent thread to start if this is the first
++     * invocation of startObserving in this process.<p>
++     * Once called, the BLEEvent thread will call onBLEEvent() when an incoming
++     * BLEEvent matches the specified string.<p>
++     * This method can be called multiple times to register multiple matches.
++     * Only one call to stopObserving is required even with multiple registered
++     * matches.
++     * @param match A substring of the BLEEvent to match. Use "" to match all
++     *              BLEEvent's
++     */
++    public final synchronized void startObserving(String match) {
++        ensureThreadStarted();
++        sThread.addObserver(match, this);
++    }
++
++    /**
++     * End observation of BLEEvent's.<p>
++     * This process's BLEEvent thread will never call onBLEEvent() on this
++     * BLEEventObserver after this call. Repeated calls have no effect.
++     */
++    public final synchronized void stopObserving() {
++        sThread.removeObserver(this);
++    }
++
++    /**
++     * Subclasses of BLEEventObserver should override this method to handle
++     * BLEEvents.
++     */
++    public abstract void onBLEEvent(BLEEvent event);
++
++    protected void finalize() throws Throwable {
++        try {
++            stopObserving();
++        } finally {
++            super.finalize();
++        }
++    }
++}
+diff --git a/android/frameworks/base/core/java/android/server/BLEBluetoothService.java b/android/frameworks/base/core/java/android/server/BLEBluetoothService.java
+index 73b2044..4fb39b7 100644
+--- a/android/frameworks/base/core/java/android/server/BLEBluetoothService.java
++++ b/android/frameworks/base/core/java/android/server/BLEBluetoothService.java
+@@ -8,6 +8,7 @@ package android.server;
+ 
+ import android.bluetooth.IBLEBluetooth;
+ import android.bluetooth.BluetoothAdapter;
++import android.os.BLEEventObserver;
+ import android.bluetooth.IBLEBluetoothCallback;
+ import android.content.BroadcastReceiver;
+ import android.content.ContentResolver;
+@@ -37,6 +38,7 @@ import java.util.Date;
+ public class BLEBluetoothService extends IBLEBluetooth.Stub
+ {
+     private static final String TAG = "BLEBluetoothService";
++    private static final String BLEEVENT_MATCH = "ble_status=";
+     private static final boolean DBG = true;
+ 
+ 	private int mAllBluetoothState;    //classic BT and BLE BT all state
+@@ -72,7 +74,7 @@ public class BLEBluetoothService extends IBLEBluetooth.Stub
+     private IBLEBluetoothCallback BLEDataListener;
+     private String mBLEMacAddress;
+ 
+-
++    private BLEObserver ble_event = null;
+     static
+     {
+         classInitNative();
+@@ -82,6 +84,7 @@ public class BLEBluetoothService extends IBLEBluetooth.Stub
+     {
+         mContext = context;
+ 
++	ble_event = new BLEObserver(context);
+         mAllBluetoothState = BluetoothAdapter.STATE_OFF;
+ 		mCBTState = BluetoothAdapter.STATE_OFF;
+ 		mBLEBTState = BluetoothAdapter.STATE_OFF;
+@@ -333,6 +336,34 @@ public class BLEBluetoothService extends IBLEBluetooth.Stub
+     }
+ 
+ 
++/***/
++    private class BLEObserver extends BLEEventObserver {
++
++    private final Context mContext;
++
++    public BLEObserver(Context context) {
++        mContext = context;
++
++        Log.d(TAG,"start BLE observing  ");
++        startObserving(BLEEVENT_MATCH);
++    }
++    @Override
++    public void onBLEEvent(BLEEventObserver.BLEEvent event) {
++            
++        Log.d(TAG,"onBLEEvent: "+event.toString());
++        synchronized (this) {
++            try {
++                int newState = Integer.parseInt(event.get("SWITCH_STATE"));
++
++        	Log.d(TAG,"onBLEEvent: newstate:  "+newState);
++            } catch (NumberFormatException e) {
++        	Log.e(TAG,"Could not parse switch state from event  "+event);
++            }
++        }
++    }
++
++
++}
+     private BLESyncThread mBLESyncThread;
+     private class BLESyncThread extends Thread
+     {
+diff --git a/android/frameworks/base/core/jni/Android.mk b/android/frameworks/base/core/jni/Android.mk
+index 028ecc8..5b33d51 100644
+--- a/android/frameworks/base/core/jni/Android.mk
++++ b/android/frameworks/base/core/jni/Android.mk
+@@ -62,6 +62,7 @@ LOCAL_SRC_FILES:= \
+ 	android_os_SystemClock.cpp \
+ 	android_os_SystemProperties.cpp \
+ 	android_os_UEventObserver.cpp \
++	android_os_BLEEventObserver.cpp \
+ 	android_net_LocalSocketImpl.cpp \
+ 	android_net_NetUtils.cpp \
+ 	android_net_TrafficStats.cpp \
+diff --git a/android/frameworks/base/core/jni/AndroidRuntime.cpp b/android/frameworks/base/core/jni/AndroidRuntime.cpp
+index 9feb20a..73e61d1 100644
+--- a/android/frameworks/base/core/jni/AndroidRuntime.cpp
++++ b/android/frameworks/base/core/jni/AndroidRuntime.cpp
+@@ -140,6 +140,7 @@ extern int register_android_os_SystemClock(JNIEnv* env);
+ extern int register_android_os_FileObserver(JNIEnv *env);
+ extern int register_android_os_FileUtils(JNIEnv *env);
+ extern int register_android_os_UEventObserver(JNIEnv* env);
++extern int register_android_bluetooth_BLEEventObserver(JNIEnv* env);
+ extern int register_android_os_MemoryFile(JNIEnv* env);
+ extern int register_android_net_LocalSocketImpl(JNIEnv* env);
+ extern int register_android_net_NetworkUtils(JNIEnv* env);
+@@ -1254,6 +1255,7 @@ static const RegJNIRec gRegJNI[] = {
+     REG_JNI(register_android_os_StatFs),
+     REG_JNI(register_android_os_SystemProperties),
+     REG_JNI(register_android_os_UEventObserver),
++    REG_JNI(register_android_bluetooth_BLEEventObserver),
+     REG_JNI(register_android_net_LocalSocketImpl),
+     REG_JNI(register_android_net_NetworkUtils),
+     REG_JNI(register_android_net_TrafficStats),
+diff --git a/android/frameworks/base/core/jni/android_os_BLEEventObserver.cpp b/android/frameworks/base/core/jni/android_os_BLEEventObserver.cpp
+new file mode 100644
+index 0000000..d4d5a09
+--- /dev/null
++++ b/android/frameworks/base/core/jni/android_os_BLEEventObserver.cpp
+@@ -0,0 +1,70 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "BLEEventObserver"
++#include "utils/Log.h"
++
++#include "hardware_legacy/ble_event.h"
++#include "jni.h"
++#include "JNIHelp.h"
++#include "android_runtime/AndroidRuntime.h"
++
++namespace android
++{
++
++static void
++android_os_BLEEventObserver_native_setup(JNIEnv *env, jclass clazz)
++{
++    if (!ble_event_init()) {
++        jniThrowException(env, "java/lang/RuntimeException",
++                          "Unable to open socket for BLEEventObserver");
++    }
++}
++
++static int
++android_os_BLEEventObserver_next_event(JNIEnv *env, jclass clazz, jbyteArray jbuffer)
++{
++    int buf_sz = env->GetArrayLength(jbuffer);
++    char *buffer = (char*)env->GetByteArrayElements(jbuffer, NULL);
++
++    int length = ble_event_next_event(buffer, buf_sz - 1);
++
++    env->ReleaseByteArrayElements(jbuffer, (jbyte*)buffer, 0);
++
++    return length;
++}
++
++static JNINativeMethod gMethods[] = {
++    {"ble_native_setup", "()V",   (void *)android_os_BLEEventObserver_native_setup},
++    {"ble_next_event",   "([B)I", (void *)android_os_BLEEventObserver_next_event},
++};
++
++
++int register_android_bluetooth_BLEEventObserver(JNIEnv *env)
++{
++    jclass clazz;
++
++    clazz = env->FindClass("android/os/BLEEventObserver");
++    if (clazz == NULL) {
++        LOGE("Can't find android/os/BLEEEventObserver");
++        return -1;
++    }
++
++    return AndroidRuntime::registerNativeMethods(env,
++                "android/os/BLEEventObserver", gMethods, NELEM(gMethods));
++}
++
++}   // namespace android
+diff --git a/android/frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsHelper.java b/android/frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsHelper.java
+index 0e75fbc..feb8f5b 100644
+--- a/android/frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsHelper.java
++++ b/android/frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsHelper.java
+@@ -108,6 +108,9 @@ public class SettingsHelper {
+     }
+ 
+     private void setBrightness(int brightness) {
++       RuntimeException here = new RuntimeException("brightnesshelper");
++       here.fillInStackTrace();
++       Log.w(TAG, "setBrightness helper Called: " + this, here);
+         try {
+             IPowerManager power = IPowerManager.Stub.asInterface(
+                     ServiceManager.getService("power"));
+diff --git a/android/frameworks/base/preloaded-classes b/android/frameworks/base/preloaded-classes
+index d9ca2b2..a7351bd 100644
+--- a/android/frameworks/base/preloaded-classes
++++ b/android/frameworks/base/preloaded-classes
+@@ -482,6 +482,7 @@ android.os.StrictMode$ViolationInfo
+ android.os.SystemClock
+ android.os.SystemProperties
+ android.os.UEventObserver
++android.os.BLEEventObserver
+ android.pim.EventRecurrence
+ android.preference.PreferenceManager
+ android.provider.BaseColumns
+diff --git a/android/hardware/libhardware_legacy/ble_event/Android.mk b/android/hardware/libhardware_legacy/ble_event/Android.mk
+new file mode 100644
+index 0000000..3959217
+--- /dev/null
++++ b/android/hardware/libhardware_legacy/ble_event/Android.mk
+@@ -0,0 +1,3 @@
++# Copyright 2008 The Android Open Source Project
++
++LOCAL_SRC_FILES += ble_event/ble_event.c
+diff --git a/android/hardware/libhardware_legacy/ble_event/ble_event.c b/android/hardware/libhardware_legacy/ble_event/ble_event.c
+new file mode 100644
+index 0000000..32fa0af
+--- /dev/null
++++ b/android/hardware/libhardware_legacy/ble_event/ble_event.c
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <hardware_legacy/ble_event.h>
++
++#include <string.h>
++#include <unistd.h>
++#include <poll.h>
++
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <linux/netlink.h>
++
++
++
++#include <cutils/log.h>
++#define NETLINK_USER 31
++#define MAX_PAYLOAD 1024 /* maximum payload size*/
++static int fd = -1;
++
++int sock_fd;
++struct sockaddr_nl src_addr, dest_addr;
++struct nlmsghdr *nlh = NULL;
++struct iovec iov;
++struct msghdr msg;
++/* Returns 0 on failure, 1 on success */
++int ble_event_init()
++{
++
++
++    sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_USER);
++
++    if (sock_fd < 0)
++        return -1;
++
++    memset(&src_addr, 0, sizeof(src_addr));
++    src_addr.nl_family = AF_NETLINK;
++    src_addr.nl_pid = getpid(); /* self pid */
++
++    bind(sock_fd, (struct sockaddr *)&src_addr, sizeof(src_addr));
++
++    memset(&dest_addr, 0, sizeof(dest_addr));
++    memset(&dest_addr, 0, sizeof(dest_addr));
++    dest_addr.nl_family = AF_NETLINK;
++    dest_addr.nl_pid = 0; /* For Linux Kernel */
++    dest_addr.nl_groups = 0; /* unicast */
++
++    nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
++    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
++
++    nlh->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
++    nlh->nlmsg_pid = getpid();
++    nlh->nlmsg_flags = 0;
++	
++    strcpy(NLMSG_DATA(nlh), "BLE_EVENT_INIT");
++
++    iov.iov_base = (void *)nlh;
++    iov.iov_len = nlh->nlmsg_len;
++    msg.msg_name = (void *)&dest_addr;
++    msg.msg_namelen = sizeof(dest_addr);
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    LOGE("Sending init message to kernel\n");
++    sendmsg(sock_fd, &msg, 0);
++    return (sock_fd > 0);
++}
++
++struct ble_status_msg
++{
++ unsigned char qpss;
++ unsigned char ancs;
++};
++int ble_event_next_event(char* buffer, int buffer_length)
++{
++    int count = 0;
++    while (1) {
++    
++    	LOGE("Waiting for message from kernel\n");
++    	recvmsg(sock_fd, &msg, 0);
++	LOGE("lh->nlmsg_len = %d",nlh->nlmsg_len);
++	LOGE("data length = %d",sizeof(NLMSG_DATA(nlh)));
++	LOGE("data length new = %d",strlen(NLMSG_DATA(nlh)));
++	LOGE("Received message payload: %s, length is %d\n",(char*) NLMSG_DATA(nlh),NLMSG_LENGTH(nlh));
++	count = strlen(NLMSG_DATA(nlh));
++        if (count > 0) {
++		memcpy(buffer,NLMSG_DATA(nlh),count);
++                return count;
++        } 
++    }
++	
++    // won't get here
++    //FIXME
++    free(nlh); 
++    close(sock_fd);
++    // won't get here
++    return 0;
++}
+diff --git a/android/hardware/libhardware_legacy/include/hardware_legacy/ble_event.h b/android/hardware/libhardware_legacy/include/hardware_legacy/ble_event.h
+new file mode 100644
+index 0000000..7e9beef
+--- /dev/null
++++ b/android/hardware/libhardware_legacy/include/hardware_legacy/ble_event.h
+@@ -0,0 +1,31 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _HARDWARE_BLEEVENT_H
++#define _HARDWARE_BLEEVENT_H
++
++#if __cplusplus
++extern "C" {
++#endif
++
++int ble_event_init();
++int ble_event_next_event(char* buffer, int buffer_length);
++
++#if __cplusplus
++} // extern "C"
++#endif
++
++#endif // _HARDWARE_BLEEVENT_H
+diff --git a/linux/linux-2.6-virt/drivers/misc/Makefile b/linux/linux-2.6-virt/drivers/misc/Makefile
+index 5e784fb..36e7f5b 100644
+--- a/linux/linux-2.6-virt/drivers/misc/Makefile
++++ b/linux/linux-2.6-virt/drivers/misc/Makefile
+@@ -41,3 +41,4 @@ obj-$(CONFIG_SENSORS_AK8975)	+= akm8975.o
+ obj-$(CONFIG_BLE_QN902X)	+= qn902x_ble.o
+ obj-$(CONFIG_BLE_QN902X)	+= qn902x_ble_ancc.o
+ obj-$(CONFIG_BLE_QN902X_FW_UPDATE)	+= qn902x_ble_fu.o
++obj-y	+= hellonetlink.o
+diff --git a/linux/linux-2.6-virt/drivers/misc/hellonetlink.c b/linux/linux-2.6-virt/drivers/misc/hellonetlink.c
+new file mode 100644
+index 0000000..63098c7
+--- /dev/null
++++ b/linux/linux-2.6-virt/drivers/misc/hellonetlink.c
+@@ -0,0 +1,72 @@
++#include <linux/module.h>
++#include <net/sock.h>
++#include <linux/netlink.h>
++#include <linux/skbuff.h>
++
++#define NETLINK_USER 31
++
++struct sock *nl_sk = NULL;
++
++static void hello_nl_recv_msg(struct sk_buff *skb)
++{
++
++    struct nlmsghdr *nlh;
++    int pid;
++    struct sk_buff *skb_out;
++    int msg_size;
++    char *msg = "ble_status=SWITCH_STATE:3";
++    int res;
++
++    printk(KERN_INFO "Entering: %s\n", __FUNCTION__);
++
++    msg_size = strlen(msg);
++
++    nlh = (struct nlmsghdr *)skb->data;
++    printk(KERN_INFO "Netlink received msg payload:%s\n", (char *)nlmsg_data(nlh));
++    pid = nlh->nlmsg_pid; /*pid of sending process */
++
++    skb_out = nlmsg_new(msg_size, 0);
++
++    if (!skb_out)
++    {
++
++        printk(KERN_ERR "Failed to allocate new skb\n");
++        return;
++
++    }
++    nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, msg_size, 0);
++    NETLINK_CB(skb_out).dst_group = 0; /* not in mcast group */
++    strncpy(nlmsg_data(nlh), msg, msg_size);
++
++    res = nlmsg_unicast(nl_sk, skb_out, pid);
++
++    if (res < 0)
++        printk(KERN_INFO "Error while sending bak to user\n");
++}
++static int __init hellonetlink_init(void)
++{
++
++    printk("Entering: %s\n", __FUNCTION__);
++    nl_sk = netlink_kernel_create(&init_net, NETLINK_USER, 0, hello_nl_recv_msg,
++                                  NULL, THIS_MODULE);
++    if (!nl_sk)
++    {
++
++        printk(KERN_ALERT "Error creating socket.\n");
++        return -10;
++
++    }
++
++    return 0;
++}
++
++static void __exit hellonetlink_exit(void)
++{
++
++    printk(KERN_INFO "exiting hellonetlink_exit module\n");  
++    netlink_kernel_release(nl_sk);  
++}
++
++module_init(hellonetlink_init);
++module_exit(hellonetlink_exit);
++
